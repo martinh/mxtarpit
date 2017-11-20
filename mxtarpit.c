@@ -63,6 +63,7 @@ struct conn {
 	enum smtp_state state;
 	ev_tstamp connected_at;
 	int is_spam;
+	int got_data;
 
 	char addr[64];
 	char helo[64];
@@ -669,6 +670,7 @@ conn_process_command(struct conn *conn, char *line)
 		check_recipient(conn, args);
 		conn_puts(conn, "250 %s", app.resp.rcpt);
 	} else if (strcmp(cmd, "data") == 0) {
+		conn->got_data = 1;
 		if (0 && conn->is_spam) {
 			conn_puts(conn, "354 %s", app.resp.data);
 			conn->state = smtp_data_response;
@@ -688,6 +690,9 @@ conn_process_command(struct conn *conn, char *line)
 	} else if (strcmp(cmd, "noop") == 0) {
 		conn_puts(conn, "250 OK");
 	} else if (strcmp(cmd, "quit") == 0) {
+		if (!conn->got_data) {
+			conn_is_spam(conn);
+		}
 		conn_puts(conn, "221 %s", app.resp.quit);
 		conn->state = smtp_close;
 	} else if (cmd[0] == '\0') {
