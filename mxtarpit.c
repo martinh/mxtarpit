@@ -830,7 +830,7 @@ conn_readable(struct ev_loop *loop, struct ev_io *w, int revents)
 }
 
 static void
-conn_write(struct conn *conn, int maxbytes)
+conn_write(struct conn *conn, size_t maxbytes)
 {
 	size_t nbytes;
 	ssize_t res;
@@ -882,7 +882,12 @@ static void
 conn_stutter(struct ev_loop *loop, struct ev_timer *w, int revents)
 {
 	struct conn *conn = w->data;
-	conn_write(conn, 1);
+	size_t maxbytes = 1;
+
+	if (w->repeat == 0) {
+		maxbytes = SIZE_MAX;
+	}
+	conn_write(conn, maxbytes);
 }
 
 static void
