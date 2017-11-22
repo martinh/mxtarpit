@@ -671,6 +671,10 @@ conn_process_command(struct conn *conn, char *line)
 		conn_puts(conn, "250 %s", app.resp.rcpt);
 	} else if (strcmp(cmd, "data") == 0) {
 		conn->got_data = 1;
+		if (conn->from[0] == '\0' || conn->rcpt[0] == '\0') {
+			/* No sender or recipient. */
+			conn_is_spam(conn);
+		}
 		if (0 && conn->is_spam) {
 			conn_puts(conn, "354 %s", app.resp.data);
 			conn->state = smtp_data_response;
