@@ -16,6 +16,7 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/queue.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
@@ -58,12 +59,16 @@ struct conn {
 	struct ev_io read_watcher;
 	struct ev_io write_watcher;
 	struct ev_timer stutter;
+	struct ev_timer dnsbl_timer;
 	struct mbuf inbuf;
 	struct mbuf outbuf;
 	enum smtp_state state;
 	ev_tstamp connected_at;
+	in_addr_t ipv4;
+	TAILQ_ENTRY(conn) dnsbl_queue;
 	int is_spam;
 	int got_data;
+	int dnsbl_pending;
 
 	char addr[64];
 	char helo[64];
@@ -106,6 +111,14 @@ struct app_globals {
 	struct passwd *pw;
 	int allow_mail_from_my_domains:1;
 	int foreground:1;
+
+	struct {
+		const char *zone;
+		int fd[2];
+		pid_t pid;
+		struct ev_io w;
+		TAILQ_HEAD(, conn) queue;
+	} dnsbl;
 } app;
 
 static void
@@ -567,10 +580,15 @@ conn_close(struct conn *conn)
 	     minutes, seconds,
 	     conn->from, conn->rcpt);
 	close(conn->fd);
+	conn->fd = -1;
 	ev_io_stop(app.loop, &conn->read_watcher);
 	ev_io_stop(app.loop, &conn->write_watcher);
 	ev_timer_stop(app.loop, &conn->stutter);
-	free(conn);
+	ev_timer_stop(app.loop, &conn->dnsbl_timer);
+
+	if (!conn->dnsbl_pending) {
+		free(conn);
+	}
 }
 
 static void
@@ -898,6 +916,29 @@ conn_writable(struct ev_loop *loop, struct ev_io *w, int revents)
 }
 
 static void
+dnsbl_lookup(struct ev_loop *loop, struct ev_timer *w, int revents)
+{
+	struct conn *conn = w->data;
+	ssize_t res;
+
+	res = write(app.dnsbl.fd[0], &conn->ipv4, sizeof(conn->ipv4));
+	if (res < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			/* Try again later? */
+			return;
+		}
+		fatal("Failed to dispatch DNSBL query: %s", strerror(errno));
+	} else if ((size_t)res != sizeof(conn->ipv4)) {
+		fatal("Failed to dispatch DNSBL query: short write");
+	} else {
+		/* Add connection to end of result queue. */
+		TAILQ_INSERT_TAIL(&app.dnsbl.queue, conn, dnsbl_queue);
+		/* Make sure queue entry stays valid until result arrives. */
+		conn->dnsbl_pending = 1;
+	}
+}
+
+static void
 conn_accept(struct ev_loop *loop, struct ev_io *w, int revents)
 {
 	struct conn *conn;
@@ -943,14 +984,15 @@ conn_accept(struct ev_loop *loop, struct ev_io *w, int revents)
 	fd_nonblock(afd);
 
 	ev_io_init(&conn->read_watcher, conn_readable, afd, EV_READ);
-
 	ev_io_init(&conn->write_watcher, conn_writable, afd, EV_WRITE);
 	ev_timer_init(&conn->stutter, conn_stutter,
 		      app.initial_stutter_interval,
 		      app.initial_stutter_interval);
+	ev_timer_init(&conn->dnsbl_timer, dnsbl_lookup, 1, 0);
 	conn->read_watcher.data = conn;
 	conn->write_watcher.data = conn;
 	conn->stutter.data = conn;
+	conn->dnsbl_timer.data = conn;
 
 	conn->state = smtp_sending_banner;
 	conn_puts(conn, "220 %s %s", app.hostname, app.resp.banner);
@@ -958,6 +1000,146 @@ conn_accept(struct ev_loop *loop, struct ev_io *w, int revents)
 	/* Start the read watcher so we can detect clients that send data
 	 * before initial banner received (which is an RFC violation). */
 	ev_io_start(app.loop, &conn->read_watcher);
+
+	/* If a DNSBL zone is configured, start the delayed lookup timer. This
+	 * avoids doing DNS queries for simple portscannings. */
+	if (app.dnsbl.zone && sa->sa_family == AF_INET) {
+		conn->ipv4 = ((struct sockaddr_in *)sa)->sin_addr.s_addr;
+		ev_timer_start(app.loop, &conn->dnsbl_timer);
+	}
+}
+
+static int
+dnsbl_check(in_addr_t ip)
+{
+	char name[64];
+	struct addrinfo hints, *ai0, *ai;
+	int res;
+
+	snprintf(name, sizeof(name), "%d.%d.%d.%d.%s",
+		 (uint8_t)((ip >> 24) & 0xFF),
+		 (uint8_t)((ip >> 16) & 0xFF),
+		 (uint8_t)((ip >> 8) & 0xFF),
+		 (uint8_t)(ip & 0xFF),
+		 app.dnsbl.zone);
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+
+	debug("[%d] resolving '%s'", getpid(), name);
+	res = getaddrinfo(name, NULL, &hints, &ai0);
+	if (res == 0) {
+		for (ai = ai0; ai; ai = ai->ai_next) {
+			name[0] = '\0';
+			res = getnameinfo(ai->ai_addr, ai->ai_addrlen,
+					  name, sizeof(name),
+					  NULL, 0, NI_NUMERICHOST);
+			if (res == 0) {
+				debug("got DNSBL result %s", name);
+			} else {
+				debug("got DNSBL error %s", gai_strerror(res));
+			}
+		}
+		freeaddrinfo(ai0);
+		return res;
+	}
+
+	return res;
+}
+
+static void
+dnsbl_result(struct ev_loop *loop, struct ev_io *w, int revents)
+{
+	struct conn *conn;
+	ssize_t res;
+	int check;
+
+	res = read(w->fd, &check, sizeof(check));
+	if (res < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			return;
+		}
+		fatal("dnsbl_result: read: %s", strerror(errno));
+	} else if (res == 0) {
+		fatal("DNSBL child died");
+	} else if ((size_t)res != sizeof(check)) {
+		fatal("dnsbl_result: short read");
+	}
+
+	debug("got result %d from DNSBL child: %s", check, gai_strerror(check));
+	conn = TAILQ_FIRST(&app.dnsbl.queue);
+	if (conn == NULL) {
+		fatal("dnsbl_result: internal error, empty queue");
+	}
+	TAILQ_REMOVE(&app.dnsbl.queue, conn, dnsbl_queue);
+
+	if (conn->fd == -1) {
+		free(conn);
+	} else if (check == 0) {
+		conn_is_spam(conn);
+	}
+}
+
+static void
+dnsbl_main(int fd)
+{
+	if (setgid(app.pw->pw_gid) == -1 || setuid(app.pw->pw_uid) == -1) {
+		fatal("%s: %s", app.pw->pw_name, strerror(errno));
+	}
+
+#ifdef __OpenBSD__
+	pledge("stdio dns", NULL);
+#endif
+
+	/* The DNSBL process uses blocking I/O. */
+	for (;;) {
+		in_addr_t ip;
+		ssize_t res;
+		int check;
+
+		res = read(fd, &ip, sizeof(ip));
+		if (res < 0) {
+			fatal("dnsbl_main: read: %s", strerror(errno));
+		} else if (res == 0) {
+			fatal("dnsbl_main: parent died");
+		} else if ((size_t)res != sizeof(ip)) {
+			fatal("dnsbl_main: short read");
+		}
+
+		check = dnsbl_check(ip);
+
+		res = write(fd, &check, sizeof(check));
+		if (res < 0) {
+			fatal("dnsbl_main: write: %s", strerror(errno));
+		} else if ((size_t)res != sizeof(check)) {
+			fatal("dnsbl_main: short write");
+		}
+	}
+}
+
+static void
+dnsbl_fork(void)
+{
+	int res;
+
+	res = socketpair(AF_LOCAL, SOCK_STREAM, 0, app.dnsbl.fd);
+	if (res == 0) {
+		app.dnsbl.pid = fork();
+	}
+	if (res == -1 || app.dnsbl.pid == -1) {
+		fatal("Unable to fork DNSBL child: %s", strerror(errno));
+	} else if (app.dnsbl.pid == 0) {
+		close(app.dnsbl.fd[0]);
+		dnsbl_main(app.dnsbl.fd[1]);
+		_exit(0);
+	} else {
+		debug("forked DNSBL child as pid %d", app.dnsbl.pid);
+		close(app.dnsbl.fd[1]);
+		fd_nonblock(app.dnsbl.fd[0]);
+		ev_io_init(&app.dnsbl.w, dnsbl_result, app.dnsbl.fd[0], EV_READ);
+		ev_io_start(app.loop, &app.dnsbl.w);
+	}
 }
 
 int
@@ -981,6 +1163,7 @@ main(int argc, char **argv)
 	}
 	app.initial_stutter_interval = 0.25;
 	app.spam_stutter_interval = 3;
+	TAILQ_INIT(&app.dnsbl.queue);
 
 	app.resp.banner = "ESMTP Fake Backup MX Tarpit Service";
 	app.resp.helo = "Hello, pleased to meet you."
@@ -998,13 +1181,16 @@ main(int argc, char **argv)
 
 	openlog("mxtarpit", LOG_CONS | LOG_NDELAY, LOG_DAEMON);
 
-	while ((c = getopt(argc, argv, "Aa:d:Fj:l:n:p:s:S:t:u:")) != -1) {
+	while ((c = getopt(argc, argv, "Aa:b:d:Fj:l:n:p:s:S:t:u:z")) != -1) {
 		switch (c) {
 		case 'A':
 			app.allow_mail_from_my_domains = 1;
 			break;
 		case 'a':
 			addrfile = optarg;
+			break;
+		case 'b':
+			app.dnsbl.zone = optarg;
 			break;
 		case 'd':
 			add_address(optarg, NULL);
@@ -1046,6 +1232,9 @@ main(int argc, char **argv)
 			break;
 		case 'u':
 			user = optarg;
+			break;
+		case 'z':
+			app.dnsbl.zone = "zen.spamhaus.org";
 			break;
 		case '?':
 			return 1;
@@ -1132,6 +1321,11 @@ main(int argc, char **argv)
 			fatal("Unable to load addresses from '%s': %s",
 			      addrfile, errbuf);
 		}
+	}
+
+	/* Fork a child to handle DNSBL queries. */
+	if (app.dnsbl.zone) {
+		dnsbl_fork();
 	}
 
 	/* Chroot to an empty directory and drop privileges. */
