@@ -1072,7 +1072,9 @@ dnsbl_result(struct ev_loop *loop, struct ev_io *w, int revents)
 	if (conn == NULL) {
 		fatal("dnsbl_result: internal error, empty queue");
 	}
+
 	TAILQ_REMOVE(&app.dnsbl.queue, conn, dnsbl_queue);
+	conn->dnsbl_pending = 0;
 
 	if (conn->fd == -1) {
 		free(conn);
