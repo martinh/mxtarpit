@@ -60,6 +60,7 @@ struct conn {
 	struct ev_io write_watcher;
 	struct ev_timer stutter;
 	struct ev_timer dnsbl_timer;
+	struct ev_timer idle_timer;
 	struct mbuf inbuf;
 	struct mbuf outbuf;
 	enum smtp_state state;
@@ -108,6 +109,7 @@ struct app_globals {
 	struct domain *domains;
 	size_t ndomains;
 	int loglevel;
+	float idle_timeout;
 	struct passwd *pw;
 	int allow_mail_from_my_domains:1;
 	int foreground:1;
@@ -585,6 +587,7 @@ conn_close(struct conn *conn)
 	ev_io_stop(app.loop, &conn->write_watcher);
 	ev_timer_stop(app.loop, &conn->stutter);
 	ev_timer_stop(app.loop, &conn->dnsbl_timer);
+	ev_timer_stop(app.loop, &conn->idle_timer);
 
 	if (!conn->dnsbl_pending) {
 		free(conn);
@@ -804,11 +807,13 @@ conn_process(struct conn *conn)
 			return;
 		case 0:
 			/* One line received and processed. */
+			ev_timer_stop(app.loop, &conn->idle_timer);
 			break;
 		}
 
 		if (conn->state == smtp_data) {
 			/* Continue processing all received data. */
+			ev_timer_again(app.loop, &conn->idle_timer);
 		} else {
 			/* Do not read more until response flushed. */
 			ev_io_stop(app.loop, &conn->read_watcher);
@@ -879,6 +884,7 @@ conn_write(struct conn *conn, size_t maxbytes)
 
 		ev_timer_stop(app.loop, &conn->stutter);
 		ev_io_stop(app.loop, &conn->write_watcher);
+		ev_timer_again(app.loop, &conn->idle_timer);
 
 		if (conn->state == smtp_close) {
 			conn_close(conn);
@@ -913,6 +919,14 @@ conn_writable(struct ev_loop *loop, struct ev_io *w, int revents)
 {
 	struct conn *conn = w->data;
 	conn_write(conn, sizeof(conn->outbuf.data));
+}
+
+static void
+conn_idle(struct ev_loop *loop, struct ev_timer *w, int revents)
+{
+	struct conn *conn = w->data;
+	debug("%d: idle timeout", conn->fd);
+	conn_close(conn);
 }
 
 static void
@@ -989,10 +1003,13 @@ conn_accept(struct ev_loop *loop, struct ev_io *w, int revents)
 		      app.initial_stutter_interval,
 		      app.initial_stutter_interval);
 	ev_timer_init(&conn->dnsbl_timer, dnsbl_lookup, 1, 0);
+	ev_init(&conn->idle_timer, conn_idle);
+	conn->idle_timer.repeat = app.idle_timeout;
 	conn->read_watcher.data = conn;
 	conn->write_watcher.data = conn;
 	conn->stutter.data = conn;
 	conn->dnsbl_timer.data = conn;
+	conn->idle_timer.data = conn;
 
 	conn->state = smtp_sending_banner;
 	conn_puts(conn, "220 %s %s", app.hostname, app.resp.banner);
@@ -1165,6 +1182,7 @@ main(int argc, char **argv)
 	}
 	app.initial_stutter_interval = 0.25;
 	app.spam_stutter_interval = 3;
+	app.idle_timeout = 300;
 	TAILQ_INIT(&app.dnsbl.queue);
 
 	app.resp.banner = "ESMTP Fake Backup MX Tarpit Service";
