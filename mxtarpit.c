@@ -672,7 +672,7 @@ conn_process_command(struct conn *conn, char *line)
 	}
 
 	mklower(cmd);
-	debug("%d: got cmd [%s] args [%s]", conn->fd, cmd, args);
+	debug("%d: got cmd [%s] args [%s]", conn->fd, cmd, args ? args : "");
 
 	if (strcmp(cmd, "helo") == 0) {
 		check_helo_fqdn(conn, args);
