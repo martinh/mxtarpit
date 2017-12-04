@@ -15,9 +15,9 @@ as it acts like an open relay.
 
 Here is what a typical SMTP conversation looks like with a spammer connection:
 
-    -> [220 mail.bzero.se ESMTP Fake Backup MX Tarpit Service]
+    -> [220 mail.example.com ESMTP Fake Backup MX Tarpit Service]
     <- [EHLO win-f1ciet00a47]
-    -> [250-mail.bzero.se Hello, pleased to meet you. Welcome to this deliberately slow electronic mail service.]
+    -> [250-mail.example.com Hello, pleased to meet you. Welcome to this deliberately slow electronic mail service.]
     -> [250-8BITMIME]
     -> [250 AUTH LOGIN PLAIN]
     <- [MAIL FROM:<lksblijmbc@example.com>]
