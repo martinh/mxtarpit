@@ -935,6 +935,11 @@ dnsbl_lookup(struct ev_loop *loop, struct ev_timer *w, int revents)
 	struct conn *conn = w->data;
 	ssize_t res;
 
+	if (conn->is_spam) {
+		/* Skip DNSBL if connection already determined to be spam. */
+		return;
+	}
+
 	res = write(app.dnsbl.fd[0], &conn->ipv4, sizeof(conn->ipv4));
 	if (res < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
